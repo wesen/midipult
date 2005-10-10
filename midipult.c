@@ -8,6 +8,8 @@
 #include <avr/signal.h>
 
 #define F_CPU     12000000UL /* 12 Mhz */
+#include <avr/delay.h>
+
 #define MIDI_BAUD 31250UL    /* 31.25 kbps */
 
 #define RB_SIZE 16
@@ -33,8 +35,30 @@ SIGNAL(SIG_UART_RECV) {
 }
 
 SIGNAL(SIG_UART_TRANS) {
+  PORTD ^= _BV(6);
   uart_put();
 }
+
+/*
+EMPTY_INTERRUPT( SIG_INTERRUPT0);
+EMPTY_INTERRUPT( SIG_INTERRUPT1);
+EMPTY_INTERRUPT( SIG_OUTPUT_COMPARE2);
+EMPTY_INTERRUPT( SIG_OVERFLOW2);
+EMPTY_INTERRUPT( SIG_INPUT_CAPTURE1);
+EMPTY_INTERRUPT( SIG_OUTPUT_COMPARE1A);
+EMPTY_INTERRUPT( SIG_OUTPUT_COMPARE1B);
+EMPTY_INTERRUPT( SIG_OVERFLOW1);
+EMPTY_INTERRUPT( SIG_OVERFLOW0);
+EMPTY_INTERRUPT( SIG_SPI);
+EMPTY_INTERRUPT( SIG_UART_DATA);
+EMPTY_INTERRUPT( SIG_ADC);
+EMPTY_INTERRUPT( SIG_EEPROM_READY);
+EMPTY_INTERRUPT( SIG_COMPARATOR);
+EMPTY_INTERRUPT( SIG_2WIRE_SERIAL);
+EMPTY_INTERRUPT( SIG_INTERRUPT2);
+EMPTY_INTERRUPT( SIG_OUTPUT_COMPARE0);
+EMPTY_INTERRUPT( SIG_SPM_READY);
+*/
 
 /*** ring buffer zeugs ***/
 
@@ -43,9 +67,12 @@ void rb_init(rb_t *rb) {
 }
 
 char rb_get(rb_t *rb) {
-  char res = rb->buf[rb->start];
-  rb->start = (rb->start + 1) % RB_SIZE;
-  rb->len--;
+  char res = 0;
+  if (rb->len > 0) {
+    res = rb->buf[rb->start];
+    rb->start = (rb->start + 1) % RB_SIZE;
+    rb->len--;
+  }
   return res;
 }
 
@@ -76,6 +103,14 @@ unsigned int rb_free(rb_t *rb) {
 /*** UART zeugs ***/
 
 void io_init(void) {
+  /* disable watchdog */
+  WDTCR = 0;
+
+  /* DD = 1, output */
+  /* PORT = 1 wenn DD = 0, dann pull-up */
+  /* portd = output */
+  DDRD = 0XFF;
+  
   /* set baudrate */
   UBRRL = (((F_CPU) / (16 * MIDI_BAUD)) - 1);
   /* enable TX, RX, interrupts */
@@ -83,12 +118,13 @@ void io_init(void) {
 
   /* XXX initialize ADCs, pull-ups, etc... */
 
+
   /* enable interrupts */
   sei();
 }
 
 void uart_put(void) {
-  if (!rb_empty(&tx_rb) && bit_is_set(UCSRA, UDRE)) {
+  if (!rb_empty(&tx_rb)) {
     char c = rb_get(&tx_rb);
     UDR = c;
   }
@@ -131,16 +167,60 @@ void midi_send_note_off(unsigned char channel, unsigned char note, unsigned char
   rb_put(&tx_rb, velocity);
   uart_flush_tx();
 }
- 
+
+/*** knoepfe und LEDs ***/
+
+#define SET_PIN_OUTPUT(port, pin) { DDR ## port |= _BV(pin); }
+#define SET_PIN_INPUT(port, pin) { DDR ## port &= ~(_BV(pin)); }
+#define SET_PIN_INPUT_PULLUP(port, pin) { SET_PIN_INPUT(port, pin); PORT ## port |= _BV(pin); }
+#define SET_PIN_LOW(port, pin) { PORT ## port &= ~(_BV(pin)); }
+#define SET_PIN_HIGH(port, pin) { PORT ## port |= _BV(pin); }
+#define PIN_VALUE(port, pin) ((PIN ## port & _BV(pin)) ? 1 : 0)
+
+#define SEL_PIN        2
+#define LED_BUTTON_PIN 3
+
+unsigned char led_status = 0;
+unsigned char button_status = 0;
+
+void ask_button(void) {
+  SET_PIN_OUTPUT(D, SEL_PIN);
+  SET_PIN_LOW(D, SEL_PIN);
+  SET_PIN_INPUT_PULLUP(D, LED_BUTTON_PIN);
+  _delay_us(10);
+  button_status = !PIN_VALUE(D, LED_BUTTON_PIN);
+}
+void set_led(void) {
+  SET_PIN_OUTPUT(D, LED_BUTTON_PIN);
+  SET_PIN_LOW(D, LED_BUTTON_PIN);
+  SET_PIN_OUTPUT(D, SEL_PIN);
+  if (led_status) {
+    SET_PIN_HIGH(D, SEL_PIN);
+  } else {
+    SET_PIN_LOW(D, SEL_PIN);
+  }
+}
+
 /*** Main ***/
 
 int main(void) {
   rb_init(&tx_rb);
   rb_init(&rx_rb);
   io_init();
-
+  
   for (;;) {
-    midi_send_note_on(4, 5, 6);
-    midi_send_note_off(4, 5, 6);
+    PORTD ^= _BV(4);
+    if (rb_empty(&tx_rb)) {
+      if (button_status)
+	rb_put(&tx_rb, 0xFF);
+      else
+	rb_put(&tx_rb, 0x00);
+      uart_flush_tx();
+    } else {
+      uart_flush_tx();
+    }
+    ask_button();
+    led_status = button_status;
+    set_led();
   }
 }
