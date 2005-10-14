@@ -1,7 +1,14 @@
 /*
+
+*mgr* http://bl0rg.net/~mgr/cruft/midiusb.motorola
+*mgr* mit uisp -dlpt=/dev/parport0 --download of=$1.motorola -dprog=dapa  -v=3
++--hash=32 gedumpt
+
  * Midipult software, atmega8535
  */
 
+/* 15 + 18 = 33 knoepfe */
+/* 56 potis */
 #include <inttypes.h>
 #include <avr/io.h>
 #include <avr/interrupt.h>
@@ -10,33 +17,45 @@
 #define F_CPU     12000000UL /* 12 Mhz */
 #include <avr/delay.h>
 
-#define MIDI_BAUD 31250UL    /* 31.25 kbps */
+
+/*** UART zeugs ***/
 
 #define RB_SIZE 16
+#define MIDI_BAUD 31250UL    /* 31.25 kbps */
 
-typedef struct {
-  char buf[RB_SIZE];
-  unsigned int start, len;
-} rb_t;
-
-static rb_t tx_rb;
-static rb_t rx_rb;
-
-void rb_put(rb_t *rb, char c);
-void uart_put(void);
-
-/*** signal zeugs ***/
-
-SIGNAL(SIG_UART_RECV) {
-  if (!rb_full(&rx_rb)) {
-    char c = UDR;
-    rb_put(&rx_rb, c);
-  }
-}
+volatile char tx_buf[RB_SIZE];
+volatile char tx_wr = 0, tx_rd = 0;
+#define TX_INCR(a, b) (((a) + (b)) & (RB_SIZE - 1))
+#define UART_TX_OK (UCSRA & _BV(UDRE))
+#define TX_FREE (!(TX_INCR(tx_wr, 1) == tx_rd))
 
 SIGNAL(SIG_UART_TRANS) {
   PORTD ^= _BV(6);
-  uart_put();
+  if (tx_rd != tx_wr) {
+    UDR = tx_buf[tx_rd];
+    tx_rd = TX_INCR(tx_rd, 1);
+  }
+}
+
+void uart_putc(char c) {
+  if (UART_TX_OK && (tx_wr == tx_rd)) {
+    UDR = c;
+  } else {
+    while (TX_INCR(tx_wr, 1) == tx_rd) ;
+    tx_buf[tx_wr] = c;
+    tx_wr = TX_INCR(tx_wr, 1);
+  }
+}
+
+void uart_init(void) {
+  tx_wr = tx_rd = 0;
+  
+  /* set baudrate */
+  UBRRL = (((F_CPU) / (16 * MIDI_BAUD)) - 1);
+  /* enable TX, interrupts */
+  UCSRB = _BV(TXEN) | _BV(TXCIE);
+
+  sei();
 }
 
 /*
@@ -59,47 +78,6 @@ EMPTY_INTERRUPT( SIG_INTERRUPT2);
 EMPTY_INTERRUPT( SIG_OUTPUT_COMPARE0);
 EMPTY_INTERRUPT( SIG_SPM_READY);
 */
-
-/*** ring buffer zeugs ***/
-
-void rb_init(rb_t *rb) {
-  rb->start = rb->len = 0;
-}
-
-char rb_get(rb_t *rb) {
-  char res = 0;
-  if (rb->len > 0) {
-    res = rb->buf[rb->start];
-    rb->start = (rb->start + 1) % RB_SIZE;
-    rb->len--;
-  }
-  return res;
-}
-
-void rb_put(rb_t *rb, char c) {
-  if (rb->len < RB_SIZE)
-    rb->buf[(rb->start + rb->len++) % RB_SIZE] = c;
-}
-
-int rb_full(rb_t *rb) {
-  return (rb->len < RB_SIZE);
-}
-
-int rb_empty(rb_t *rb) {
-  return (rb->len == 0);
-}
-
-unsigned int rb_len(rb_t *rb) {
-  return rb->len;
-}
-
-unsigned int rb_free(rb_t *rb) {
-  return (RB_SIZE - rb->len);
-}
-
-
-#define loop_until_rb_free(rb, len) do {} while(rb_free((rb)) < (len))
-
 /*** UART zeugs ***/
 
 void io_init(void) {
@@ -111,34 +89,17 @@ void io_init(void) {
   /* portd = output */
   DDRD = 0XFF;
   
-  /* set baudrate */
-  UBRRL = (((F_CPU) / (16 * MIDI_BAUD)) - 1);
-  /* enable TX, RX, interrupts */
-  UCSRB = _BV(TXEN) | _BV(RXEN) | _BV(RXCIE) | _BV(TXCIE);
+  /* enable ADC */
+  ADCSRA |= _BV(ADEN);
+  ADMUX |= _BV(ADLAR);
 
-  /* XXX initialize ADCs, pull-ups, etc... */
-
-
-  /* enable interrupts */
-  sei();
-}
-
-void uart_put(void) {
-  if (!rb_empty(&tx_rb)) {
-    char c = rb_get(&tx_rb);
-    UDR = c;
-  }
-}
-
-void uart_flush_tx(void) {
-  loop_until_bit_is_set(UCSRA, UDRE);
-  uart_put();
+  uart_init();
 }
 
 /*** MIDI zeugs ***/
 
-#define MIDI_NOTE_ON     0x8
-#define MIDI_NOTE_OFF    0x9
+#define MIDI_NOTE_ON     0x9
+#define MIDI_NOTE_OFF    0x8
 #define MIDI_AFTERTOUCH  0xA
 #define MIDI_CC          0xB
 #define MIDI_PROG_CHANGE 0xC
@@ -153,22 +114,27 @@ static inline midi_is_status(char c) {
 }
 
 void midi_send_note_on(unsigned char channel, unsigned char note, unsigned char velocity) {
-  loop_until_rb_free(&tx_rb, 3);
-  rb_put(&tx_rb, (MIDI_NOTE_ON << 4) | channel);
-  rb_put(&tx_rb, note);
-  rb_put(&tx_rb, velocity);
-  uart_flush_tx();
+  uart_putc((MIDI_NOTE_ON << 4) | channel);
+  uart_putc(note);
+  uart_putc(velocity);
 }
 
 void midi_send_note_off(unsigned char channel, unsigned char note, unsigned char velocity) {
-  loop_until_rb_free(&tx_rb, 3);
-  rb_put(&tx_rb, (MIDI_NOTE_OFF << 4) | channel);
-  rb_put(&tx_rb, note);
-  rb_put(&tx_rb, velocity);
-  uart_flush_tx();
+  uart_putc((MIDI_NOTE_OFF << 4) | channel);
+  uart_putc(note);
+  uart_putc(velocity);
 }
 
 /*** knoepfe und LEDs ***/
+
+#define LED_BUTTON_SEL_PORT        C
+#define PORTLED_BUTTON_SEL_PORT        PORTC
+#define DDRLED_BUTTON_SEL_PORT  DDRC
+
+#define LED_BUTTON_PORT     D
+#define PORTLED_BUTTON_PORT PORTD
+#define DDRLED_BUTTON_PORT  DDRD
+#define PINLED_BUTTON_PORT  PIND
 
 #define SET_PIN_OUTPUT(port, pin) { DDR ## port |= _BV(pin); }
 #define SET_PIN_INPUT(port, pin) { DDR ## port &= ~(_BV(pin)); }
@@ -177,50 +143,156 @@ void midi_send_note_off(unsigned char channel, unsigned char note, unsigned char
 #define SET_PIN_HIGH(port, pin) { PORT ## port |= _BV(pin); }
 #define PIN_VALUE(port, pin) ((PIN ## port & _BV(pin)) ? 1 : 0)
 
-#define SEL_PIN        2
-#define LED_BUTTON_PIN 3
+#define NUM_BUTTONS 30
 
-unsigned char led_status = 0;
-unsigned char button_status = 0;
+#define BUTTON_STATUS(i) (button_status[(i)] & 0xF)
+#define SET_BUTTON_STATUS(i, val) { button_status[(i)] = button_status[(i)] & 0xF0 | (val); }
+#define LED_STATUS(i) ((button_status[(i)] >> 4) & 0xF)
+#define SET_LED_STATUS(i, val) { button_status[(i)] = button_status[(i)] & 0xF | ((val) << 4); }
 
-void ask_button(void) {
-  SET_PIN_OUTPUT(D, SEL_PIN);
-  SET_PIN_LOW(D, SEL_PIN);
-  SET_PIN_INPUT_PULLUP(D, LED_BUTTON_PIN);
-  _delay_us(10);
-  button_status = !PIN_VALUE(D, LED_BUTTON_PIN);
+#define BUTTON_NOTHING  0
+#define BUTTON_PRESSED  1
+#define BUTTON_NORMAL   2
+#define BUTTON_RELEASED 3
+
+/* debounce:
+   2 bits pro knopf
+   0 -> 1 (bounce?) -> 2
+   wenn knopf auf 1 dann nachricht senden (note on), wieder auf 0 (note off)
+*/
+
+#define BUTTON_ROWS 5
+unsigned char button_status[BUTTON_ROWS * 8];
+
+void init_buttons(void) {
+  int i, j;
+  for (i = 0; i < BUTTON_ROWS; i++)
+    for (j = 0; j < 8; j++)
+      button_status[i + j * BUTTON_ROWS] = BUTTON_NOTHING;
 }
-void set_led(void) {
-  SET_PIN_OUTPUT(D, LED_BUTTON_PIN);
-  SET_PIN_LOW(D, LED_BUTTON_PIN);
-  SET_PIN_OUTPUT(D, SEL_PIN);
-  if (led_status) {
-    SET_PIN_HIGH(D, SEL_PIN);
-  } else {
-    SET_PIN_LOW(D, SEL_PIN);
+
+void ask_button(unsigned char button_pin, unsigned char sel_pin) {
+  SET_PIN_LOW(LED_BUTTON_SEL_PORT, sel_pin);
+  SET_PIN_INPUT_PULLUP(LED_BUTTON_PORT, button_pin + 2);
+  unsigned char val = PIN_VALUE(LED_BUTTON_PORT, button_pin + 2);
+  SET_PIN_HIGH(LED_BUTTON_SEL_PORT, sel_pin);
+  unsigned char button = sel_pin * BUTTON_ROWS + button_pin;
+  switch (button_status[button]) {
+  case BUTTON_NOTHING:
+    if (!val)
+      button_status[button] = BUTTON_PRESSED;
+    break;
+  case BUTTON_PRESSED:
+  case BUTTON_NORMAL:
+    if (val)
+      button_status[button] = BUTTON_RELEASED;
+    break;
+  case BUTTON_RELEASED:
+    if (val)
+      button_status[button] = BUTTON_NOTHING;
+    else
+      button_status[button] = BUTTON_PRESSED;
+    break;
   }
+}
+
+void ask_buttons(void) {
+  int i, j;
+
+  /* all high */
+  DDRLED_BUTTON_SEL_PORT = 0xFF;
+  PORTLED_BUTTON_SEL_PORT = 0xFF;
+  
+  for (i = 0; i < BUTTON_ROWS; i++)
+    for (j = 0; j < 8; j++)
+      ask_button(i, j);
+}
+
+void midi_buttons(void) {
+  int i, j;
+  for (i = 0; i < BUTTON_ROWS; i++)
+    for (j = 0; j < 8; j++) {
+      unsigned char button = i + j * BUTTON_ROWS;
+      switch (button_status[button]) {
+      case BUTTON_NOTHING:
+      case BUTTON_NORMAL:
+	break;
+      case BUTTON_PRESSED:
+	midi_send_note_on(1, 30 + button, 128);
+	button_status[button] = BUTTON_NORMAL;
+	_delay_ms(10);
+	break;
+      case BUTTON_RELEASED:
+	midi_send_note_off(1, 30 + button, 128);
+	button_status[button] = BUTTON_NOTHING;
+	_delay_ms(10);
+	break;
+      }
+    }
+}
+
+#if 0
+void set_led(unsigned char sel_pin, unsigned char led_pin) {
+  SET_PIN_OUTPUT(LED_BUTTON_PORT, led_pin);
+  SET_PIN_LOW(LED_BUTTON_PORT, led_pin);
+  SET_PIN_OUTPUT(LED_BUTTON_SEL_PORT, sel_pin);
+  if (LED_STATUS(sel_pin * led_pin)) {
+    SET_PIN_HIGH(LED_BUTTON_SEL_PORT, sel_pin);
+  } else {
+    SET_PIN_LOW(LED_BUTTON_SEL_PORT, sel_pin);
+  }
+}
+
+void set_leds(void) {
+  int i, j;
+  for (i = 0; i < 6; i++)
+    for (j = 0; j < 8; j++)
+      set_led(i, j);
+}
+#endif
+		       
+/*** ADCs ***/
+
+#define POTI_SEL_PORT        B
+#define PORTPOTI_SEL_PORT PORTB
+#define DDRPOTI_SEL_PORT  DDRB
+
+#define NUM_POTIS 64
+unsigned char poti_status[NUM_POTIS];
+
+void ask_poti(unsigned char sel_pin, unsigned char adc) {
+  SET_PIN_OUTPUT(POTI_SEL_PORT, sel_pin);
+  SET_PIN_LOW(POTI_SEL_PORT, sel_pin);
+  ADMUX = (ADMUX & 0xF0) | adc;
+  ADCSRA |= _BV(ADSC);
+  loop_until_bit_is_clear(ADCSRA, ADSC);
+  poti_status[sel_pin * adc] = ADCH;
+}
+
+void ask_potis(void) {
+  int i, j;
+  for (i = 0; i < 8; i++)
+    for (j = 0; j < 8; j++)
+      ask_poti(i, j);
 }
 
 /*** Main ***/
 
 int main(void) {
-  rb_init(&tx_rb);
-  rb_init(&rx_rb);
   io_init();
+  init_buttons();
   
   for (;;) {
-    PORTD ^= _BV(4);
-    if (rb_empty(&tx_rb)) {
-      if (button_status)
-	rb_put(&tx_rb, 0xFF);
-      else
-	rb_put(&tx_rb, 0x00);
-      uart_flush_tx();
-    } else {
-      uart_flush_tx();
-    }
-    ask_button();
-    led_status = button_status;
-    set_led();
+#if 0
+    midi_send_note_on(1, 60, 128);
+    _delay_ms(10);
+    midi_send_note_off(1, 60, 128);
+    _delay_ms(20);
+#endif
+    
+    ask_buttons();
+    //    ask_potis();
+    midi_buttons();
+    //    set_leds();
   }
 }
