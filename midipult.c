@@ -1,9 +1,4 @@
 /*
-
-*mgr* http://bl0rg.net/~mgr/cruft/midiusb.motorola
-*mgr* mit uisp -dlpt=/dev/parport0 --download of=$1.motorola -dprog=dapa  -v=3
-+--hash=32 gedumpt
-
  * Midipult software, atmega8535
  */
 
@@ -58,26 +53,6 @@ void uart_init(void) {
   sei();
 }
 
-/*
-EMPTY_INTERRUPT( SIG_INTERRUPT0);
-EMPTY_INTERRUPT( SIG_INTERRUPT1);
-EMPTY_INTERRUPT( SIG_OUTPUT_COMPARE2);
-EMPTY_INTERRUPT( SIG_OVERFLOW2);
-EMPTY_INTERRUPT( SIG_INPUT_CAPTURE1);
-EMPTY_INTERRUPT( SIG_OUTPUT_COMPARE1A);
-EMPTY_INTERRUPT( SIG_OUTPUT_COMPARE1B);
-EMPTY_INTERRUPT( SIG_OVERFLOW1);
-EMPTY_INTERRUPT( SIG_OVERFLOW0);
-EMPTY_INTERRUPT( SIG_SPI);
-EMPTY_INTERRUPT( SIG_UART_DATA);
-EMPTY_INTERRUPT( SIG_ADC);
-EMPTY_INTERRUPT( SIG_EEPROM_READY);
-EMPTY_INTERRUPT( SIG_COMPARATOR);
-EMPTY_INTERRUPT( SIG_2WIRE_SERIAL);
-EMPTY_INTERRUPT( SIG_INTERRUPT2);
-EMPTY_INTERRUPT( SIG_OUTPUT_COMPARE0);
-EMPTY_INTERRUPT( SIG_SPM_READY);
-*/
 /*** UART zeugs ***/
 
 void io_init(void) {
@@ -278,7 +253,7 @@ void init_potis(void) {
 
 volatile unsigned short last_adc;
 
-#define MIN_THRESHOLD 0x2000
+#define MIN_THRESHOLD 0x2100
 #define MAX_THRESHOLD 0xF000
 
 unsigned char convert_to_cc(unsigned short adc) {
@@ -302,7 +277,7 @@ void ask_poti(unsigned char sel_pin, unsigned char adc) {
   unsigned char val = convert_to_cc(last_adc);
   unsigned char poti = sel_pin + 8 * adc;
   unsigned char old = poti_status[poti] & 0x7f;
-  if (abs(val - old) > 1)
+  if ((val != old) && ((val == 00) || (val == 0x7F) || (abs(val - old) > 1)))
     poti_status[poti] = 0x80 | val;
 }
 
@@ -334,7 +309,6 @@ void midi_potis(void) {
 int main(void) {
   io_init();
 
-#if 1
   init_buttons();
   init_potis();
 
@@ -343,50 +317,20 @@ int main(void) {
   DDRA = 0x00;
   PORTA = 0xFF;
   ADMUX = 0;
+
+  int i;
+  for (i =0 ; i < 100; i++) {
+    ask_buttons();
+    ask_potis();
+  }
   
   for (;;) {
     
     ask_buttons();
 
-#if 0
-    ask_poti(0, 3);
-
-    int i, j; 
-    for (i = 0; i < BUTTON_ROWS; i++)
-      for (j = 0; j < 8; j++) {
-	unsigned char button = i + j * BUTTON_ROWS;
-	if (button_status[button] == BUTTON_PRESSED) {
-	  midi_send_cc(1, 1, convert_to_cc(last_adc));
-	  button_status[button] == BUTTON_NORMAL;
-	  break;
-	}
-      }
-#endif
-    
     midi_buttons();
     
     ask_potis();
     midi_potis();
   }
-#else
-
-  /* poti test */
-  DDRPOTI_SEL_PORT = 0xFF;
-  PORTPOTI_SEL_PORT = 0xFE;
-
-  DDRA = 0x00;
-  PORTA = 0xFF;
-
-  unsigned char adc = 3;
-  for (;;) {
-    ADMUX = (ADMUX & 0xF0) | adc;
-    ADCSRA |= _BV(ADSC);
-    loop_until_bit_is_clear(ADCSRA, ADIF);
-    unsigned char val2 = ADCH >> 1;
-    unsigned char val = 1;
-    ADCSRA |= _BV(ADIF);
-    midi_send_cc(1, val, val2);
-    _delay_ms(20);
-  }
-#endif
 }
