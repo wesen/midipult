@@ -90,8 +90,11 @@ void io_init(void) {
   DDRD = 0XFF;
   
   /* enable ADC */
-  ADCSRA |= _BV(ADEN);
-  ADMUX |= _BV(ADLAR);
+  DDRA = 0;
+  PORTA = 0xFF;
+  ADMUX = _BV(ADLAR);
+  ADCSRA = _BV(ADEN)|_BV(ADPS2)|_BV(ADPS1)|_BV(ADPS0);
+  // ADCSRA = _BV(ADEN);
 
   uart_init();
 }
@@ -123,6 +126,12 @@ void midi_send_note_off(unsigned char channel, unsigned char note, unsigned char
   uart_putc((MIDI_NOTE_OFF << 4) | channel);
   uart_putc(note);
   uart_putc(velocity);
+}
+
+void midi_send_cc(unsigned char channel, unsigned char controller, unsigned char value) {
+  uart_putc((MIDI_CC << 4) | channel);
+  uart_putc(controller);
+  uart_putc(value);
 }
 
 /*** knoepfe und LEDs ***/
@@ -220,12 +229,12 @@ void midi_buttons(void) {
       case BUTTON_PRESSED:
 	midi_send_note_on(1, 30 + button, 128);
 	button_status[button] = BUTTON_NORMAL;
-	_delay_ms(10);
+	//	_delay_ms(10);
 	break;
       case BUTTON_RELEASED:
 	midi_send_note_off(1, 30 + button, 128);
 	button_status[button] = BUTTON_NOTHING;
-	_delay_ms(10);
+	//	_delay_ms(10);
 	break;
       }
     }
@@ -260,39 +269,124 @@ void set_leds(void) {
 #define NUM_POTIS 64
 unsigned char poti_status[NUM_POTIS];
 
+void init_potis(void) {
+  int i, j;
+  for (i = 0; i < 8; i++)
+    for (j = 0; j < 8; j++)
+      poti_status[i * 8 + j] = 0x00;
+}
+
+volatile unsigned short last_adc;
+
+#define MIN_THRESHOLD 0x2000
+#define MAX_THRESHOLD 0xF000
+
+unsigned char convert_to_cc(unsigned short adc) {
+  if (adc < MIN_THRESHOLD) return 0;
+  if (adc > MAX_THRESHOLD) return 0x7F;
+  uint32_t bla = (uint32_t)((uint32_t)adc - (uint32_t)MIN_THRESHOLD);
+  bla *= 0x7F;
+  bla /= 0xDFF0;
+  return bla;
+}
+
 void ask_poti(unsigned char sel_pin, unsigned char adc) {
-  SET_PIN_OUTPUT(POTI_SEL_PORT, sel_pin);
   SET_PIN_LOW(POTI_SEL_PORT, sel_pin);
-  ADMUX = (ADMUX & 0xF0) | adc;
+  _delay_us(50);
+  ADMUX = _BV(ADLAR) | adc;
   ADCSRA |= _BV(ADSC);
+  loop_until_bit_is_set(ADCSRA, ADIF);
   loop_until_bit_is_clear(ADCSRA, ADSC);
-  poti_status[sel_pin * adc] = ADCH;
+  last_adc = ADC;
+  SET_PIN_HIGH(POTI_SEL_PORT, sel_pin);
+  unsigned char val = convert_to_cc(last_adc);
+  unsigned char poti = sel_pin + 8 * adc;
+  unsigned char old = poti_status[poti] & 0x7f;
+  if (abs(val - old) > 1)
+    poti_status[poti] = 0x80 | val;
 }
 
 void ask_potis(void) {
   int i, j;
+
+  DDRPOTI_SEL_PORT = 0xFF;
+  PORTPOTI_SEL_PORT = 0xFF;
+
   for (i = 0; i < 8; i++)
     for (j = 0; j < 8; j++)
       ask_poti(i, j);
+}
+
+void midi_potis(void) {
+  int i, j;
+  for (i = 0; i < 8; i++)
+    for (j = 0; j < 8; j++) {
+      unsigned char poti = i * 8 + j;
+      if (poti_status[poti] & 0x80) {
+	midi_send_cc(1, poti, poti_status[poti] & 0x7F);
+	poti_status[poti] &= 0x7F;
+      }
+    }
 }
 
 /*** Main ***/
 
 int main(void) {
   io_init();
+
+#if 1
   init_buttons();
+  init_potis();
+
+  DDRPOTI_SEL_PORT = 0xFF;
+  PORTPOTI_SEL_PORT = 0xFF;
+  DDRA = 0x00;
+  PORTA = 0xFF;
+  ADMUX = 0;
   
   for (;;) {
-#if 0
-    midi_send_note_on(1, 60, 128);
-    _delay_ms(10);
-    midi_send_note_off(1, 60, 128);
-    _delay_ms(20);
-#endif
     
     ask_buttons();
-    //    ask_potis();
+
+#if 0
+    ask_poti(0, 3);
+
+    int i, j; 
+    for (i = 0; i < BUTTON_ROWS; i++)
+      for (j = 0; j < 8; j++) {
+	unsigned char button = i + j * BUTTON_ROWS;
+	if (button_status[button] == BUTTON_PRESSED) {
+	  midi_send_cc(1, 1, convert_to_cc(last_adc));
+	  button_status[button] == BUTTON_NORMAL;
+	  break;
+	}
+      }
+#endif
+    
     midi_buttons();
-    //    set_leds();
+    
+    ask_potis();
+    midi_potis();
   }
+#else
+
+  /* poti test */
+  DDRPOTI_SEL_PORT = 0xFF;
+  PORTPOTI_SEL_PORT = 0xFE;
+
+  DDRA = 0x00;
+  PORTA = 0xFF;
+
+  unsigned char adc = 3;
+  for (;;) {
+    ADMUX = (ADMUX & 0xF0) | adc;
+    ADCSRA |= _BV(ADSC);
+    loop_until_bit_is_clear(ADCSRA, ADIF);
+    unsigned char val2 = ADCH >> 1;
+    unsigned char val = 1;
+    ADCSRA |= _BV(ADIF);
+    midi_send_cc(1, val, val2);
+    _delay_ms(20);
+  }
+#endif
 }
